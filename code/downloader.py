@@ -5,7 +5,6 @@ import re
 import os
 from slugify import slugify
 
-
 class Downloader(object):
     def __init__(
         self,
@@ -63,23 +62,18 @@ class Downloader(object):
                 slugify(title),
             )
         ).rstrip('/')
-
+        
         if not os.path.exists(base_path):
             os.makedirs(base_path)
 
         for u in data['_embedded']['units']['_embedded']['units']:
             for s in u['_embedded']['sessions']['_embedded']['sessions']:
                 video_id = None
-
+                video_url = None
                 if 'video_hashed_id' in s and s['video_hashed_id']:
                     video_id = s['video_hashed_id'].split(':')[1]
-
+                    video_url = self.fetch_video_url_by_id(video_id)
                 if not video_id:
-                    # NOTE: this happens sometimes...
-                    # seems random and temporary but might be some random
-                    # server-side check on user-agent etc?
-                    # ...think it's more stable now with those set to
-                    # emulate an android device
                     raise Exception('Failed to read video ID from data')
 
                 s_title = s['title']
@@ -92,79 +86,85 @@ class Downloader(object):
                     slugify(s_title),
                 )
 
-                self.download_video(
-                    fpath='{base_path}/{session}.mp4'.format(
-                        base_path=base_path,
-                        session=file_name,
-                    ),
-                    video_id=video_id,
-                )
-
-                print('')
-
+                file_path = os.path.join(base_path, file_name)
+                with open(file_path, 'wb') as f:
+                    response = requests.get(video_url, stream=True)
+                    total_length = response.headers.get('content-length')
+                    if total_length is None:  # no content length header
+                        f.write(response.content)
+                    else:
+                        dl = 0
+                        total_length = int(total_length)
+                        for data in response.iter_content(4096):
+                            dl += len(data)
+                            f.write(data)
+                            done = int(50 * dl / total_length)
+                            sys.stdout.write("\r[%s%s] Downloading %s " % ('=' * done, ' ' * (50-done), file_name))    
+                            sys.stdout.flush()
+                print("\n")
     def fetch_course_data_by_class_id(self, class_id):
-        res = requests.get(
-            url='https://api.skillshare.com/classes/{}'.format(class_id),
-            headers={
-                'Accept': 'application/vnd.skillshare.class+json;,version=0.8',
-                'User-Agent': 'Skillshare/5.3.0; Android 9.0.1',
-                'Host': 'api.skillshare.com',
-                'Referer': 'https://www.skillshare.com/',
-                'cookie': self.cookie,
-            }
+        headers = {
+            'accept': 'application/json',
+            'accept-encoding': 'gzip, deflate, br',
+            'accept-language': 'en-US,en;q=0.9,fr;q=0.8',
+            'content-type': 'application/json',
+            'cookie': self.cookie,
+            'origin': 'https://www.skillshare.com',
+            'referer': 'https://www.skillshare.com/classes/{}'.format(class_id),
+            'sec-fetch-mode': 'cors',
+            'sec-fetch-site': 'same-origin',
+            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/79.0.3945.130 Safari/537.36',
+        }
+
+        params = (
+            ('class_id', class_id),
         )
 
-        if not res.status_code == 200:
-            raise Exception('Fetch error, code == {}'.format(res.status_code))
+        response = requests.get(
+            'https://www.skillshare.com/classes/{}/playlist'.format(class_id), headers=headers, params=params)
 
-        return res.json()
+        if response.status_code != 200:
+            raise Exception(
+                'Failed to fetch course data, status code: {}, content: {}'.format(
+                    response.status_code, response.text))
 
-    def download_video(self, fpath, video_id):
-        meta_url = 'https://edge.api.brightcove.com/playback/v1/accounts/{account_id}/videos/{video_id}'.format(
-            account_id=self.brightcove_account_id,
-            video_id=video_id,
+        return json.loads(response.text)
+
+    def fetch_video_url_by_id(self, video_id):
+        headers = {
+            'accept': 'application/json',
+            'accept-encoding': 'gzip, deflate, br',
+            'accept-language': 'en-US,en;q=0.9,fr;q=0.8',
+            'content-type': 'application/json',
+            'origin': 'https://www.skillshare.com',
+            'referer': 'https://www.skillshare.com/',
+            'sec-fetch-mode': 'cors',
+            'sec-fetch-site': 'same-origin',
+            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/79.0.3945.130 Safari/537.36',
+        }
+
+        params = (
+            ('video_id', video_id),
+            ('account_id', self.brightcove_account_id),
+            ('pk', self.pk),
         )
 
-        meta_res = requests.get(
-            meta_url,
-            headers={
-                'Accept': 'application/json;pk={}'.format(self.pk),
-                'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:52.0) Gecko/20100101 Firefox/52.0',
-                'Origin': 'https://www.skillshare.com'
-            }
-        )
+        response = requests.get(
+            'https://edge.api.brightcove.com/playback/v1/accounts/{}/videos/{}'.format(
+                self.brightcove_account_id, video_id), headers=headers, params=params)
 
-        if meta_res.status_code != 200:
-            raise Exception('Failed to fetch video meta')
+        if response.status_code != 200:
+                        raise Exception(
+                'Failed to fetch video url, status code: {}, content: {}'.format(
+                    response.status_code, response.text))
 
-        for x in meta_res.json()['sources']:
-            if 'container' in x:
-                if x['container'] == 'MP4' and 'src' in x:
-                    dl_url = x['src']
-                    break
+        video_data = json.loads(response.text)
+        highest_resolution = None
+        for source in video_data['sources']:
+            if source['container'] == "MP4" and (highest_resolution is None or source['height'] > highest_resolution['height']):
+                highest_resolution = source
+        return highest_resolution['src']
 
-        print('Downloading {}...'.format(fpath))
 
-        if os.path.exists(fpath):
-            print('Video already downloaded, skipping...')
-            return
 
-        with open(fpath, 'wb') as f:
-            response = requests.get(dl_url, allow_redirects=True, stream=True)
-            total_length = response.headers.get('content-length')
 
-            if not total_length:
-                f.write(response.content)
-
-            else:
-                dl = 0
-                total_length = int(total_length)
-
-                for data in response.iter_content(chunk_size=4096):
-                    dl += len(data)
-                    f.write(data)
-                    done = int(50 * dl / total_length)
-                    sys.stdout.write("\r[%s%s]" % ('=' * done, ' ' * (50 - done)))
-                    sys.stdout.flush()
-
-            print('')
